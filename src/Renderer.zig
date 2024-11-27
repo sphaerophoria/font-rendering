@@ -94,6 +94,127 @@ pub fn drawLine(self: *Renderer, ax: i64, ay: i64, bx: i64, by: i64, width: i64,
     }
 }
 
+const CanvasPoint = @Vector(2, i64);
+
+fn findBezierTForY(ay: f32, by: f32, cy: f32, y: f32) [2]f32 {
+    const denominator_i = ay - 2 * by + cy;
+
+    if (denominator_i == 0) {
+        // Linear function
+        var ret = -1 * (-2 * by + cy + y);
+        // FIXME: What if denom is 0
+        ret /= 2 * (by - cy);
+        return .{ ret, ret };
+    }
+
+    var numerator: f32 = -ay * cy + ay * y + by * by - 2 * by * y + cy * y;
+    numerator = @sqrt(numerator);
+    const offs_term: f32 = ay - by;
+    const denominator: f32 = denominator_i;
+    const out_1  = (numerator + offs_term) / denominator;
+    const out_2  = -(numerator - offs_term) / denominator;
+    return .{ out_1, out_2 };
+}
+
+pub fn sampleQuadBezierCurve(a: @Vector(2, f32), b: @Vector(2, f32), c: @Vector(2, f32), t: f32) @Vector(2, f32) {
+    const t_splat: @Vector(2, f32) = @splat(t);
+    const ab = std.math.lerp(a, b, t_splat);
+    const bc = std.math.lerp(b, c, t_splat);
+
+    return std.math.lerp(ab, bc, t_splat);
+}
+
+
+test "bezier solving" {
+    const curves = [_][3]@Vector(2, f32) {
+        .{
+            .{-20, 20},
+            .{0, 0},
+            .{20, 20},
+        },
+        .{
+            .{-15, -30},
+            .{5, 15},
+            .{10, 20},
+        },
+        .{
+            .{40, -30},
+            .{80, -10},
+            .{20, 10},
+        },
+    };
+
+    const ts = [_]f32{
+        0.0, 0.1, 0.4, 0.5, 0.8, 1.0
+    };
+
+    for (curves) |curve| {
+        for (ts) |in_t| {
+            const point1 = sampleQuadBezierCurve(
+                curve[0],
+                curve[1],
+                curve[2],
+                in_t,
+            );
+
+            var t1, var t2 = findBezierTForY(curve[0][1], curve[1][1], curve[2][1], point1[1]);
+            if (@abs(t1 - in_t) > @abs(t2 - in_t)) {
+                std.mem.swap(f32, &t1, &t2);
+            }
+            try std.testing.expectApproxEqAbs(t1, in_t, 0.001);
+
+            if (t2 <= 1.0 and t2 >= 0.0) {
+
+                const point2 = sampleQuadBezierCurve(
+                    curve[0],
+                    curve[1],
+                    curve[2],
+                    t2,
+                );
+
+                try std.testing.expectApproxEqAbs(point2[1], point1[1], 0.001);
+            }
+        }
+    }
+}
+
+pub fn drawBezier(self: *Renderer, a: CanvasPoint, b: CanvasPoint, c: CanvasPoint, color: Color) void {
+    const a_f: @Vector(2, f32) = @floatFromInt(a);
+    const b_f: @Vector(2, f32) = @floatFromInt(b);
+    const c_f: @Vector(2, f32) = @floatFromInt(c);
+
+    const min_y = self.clampedY(std.mem.min(i64, &.{a[1], b[1], c[1]}));
+    const max_y = self.clampedY(std.mem.max(i64, &.{a[1], b[1], c[1]}));
+
+    var y = min_y;
+    while (y < max_y) {
+        defer y += 1;
+
+        const t1s = findBezierTForY(a_f[1], b_f[1], c_f[1], @floatFromInt(y));
+        const t2s = findBezierTForY(a_f[1], b_f[1], c_f[1], @floatFromInt(y + 1));
+        for (t1s, t2s) |t1, t2| {
+            if (!(t1 >= 0.0 and t1 <= 1.0 and t2 >= 0.0 and t2 <= 1.0)) {
+                std.debug.print("Skipping due to T {d} {d}\n", .{t1, t2});
+                continue;
+            }
+            const x1_f = sampleQuadBezierCurve(a_f, b_f, c_f, t1)[0];
+            const x2_f = sampleQuadBezierCurve(a_f, b_f, c_f, t2)[0];
+            const x1_px: i64 = @intFromFloat(@round(x1_f));
+            const x2_px: i64 = @intFromFloat(@round(x2_f + 1));
+
+            const x1_clamped: usize = @intCast(self.clampedX(@min(x1_px, x2_px)));
+            const x2_clamped: usize = @intCast(self.clampedX(@max(x1_px, x2_px) + 1));
+
+            if (x2_clamped - x1_clamped == 0) {
+                std.debug.print("Nothing rendering sadge :(\n", .{});
+            }
+
+            const row = self.getRow(y);
+            @memset(row[x1_clamped..x2_clamped], color);
+        }
+    }
+}
+
 pub fn writePpm(self: Renderer, writer: anytype) !void {
     try writer.print(
         \\P6

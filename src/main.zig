@@ -428,14 +428,16 @@ pub const CharGenerator = struct {
 };
 
 const IVec2 = @Vector(2, i16);
+
 pub const GlyphSegmentIter = struct {
     glyph: GlyphTable.SimpleGlyph,
     x_acc: i16 = 0,
     y_acc: i16 = 0,
-    first_contour_point: IVec2,
 
     idx: usize = 0,
     contour_idx: usize = 0,
+    last_contour_last_point: IVec2 = .{ 0, 0 },
+
 
     pub const Output = union(enum) {
         line: struct {
@@ -450,19 +452,15 @@ pub const GlyphSegmentIter = struct {
     };
 
     pub fn init(glyph: GlyphTable.SimpleGlyph) GlyphSegmentIter {
-        var ret = GlyphSegmentIter{
+        return GlyphSegmentIter{
             .glyph = glyph,
-            // FIXME: ew, bad API
-            .first_contour_point = undefined,
         };
-
-        ret.first_contour_point = ret.getPoint(0).pos;
-        return ret;
     }
+
 
     pub fn next(self: *GlyphSegmentIter) ?Output {
         while (true) {
-            if (self.idx >= self.glyph.x_coordinates.len - 1) return null;
+            if (self.idx >= self.glyph.x_coordinates.len) return null;
             defer self.idx += 1;
 
             const a = self.getPoint(self.idx);
@@ -471,15 +469,17 @@ pub const GlyphSegmentIter = struct {
             defer self.y_acc = a.pos[1];
 
             if (self.glyph.end_pts_of_contours[self.contour_idx] == self.idx) {
+                // FIXME: Stateful APIs using contour idx are gross
+                const b = self.getPoint(self.idx + 1);
                 self.contour_idx += 1;
+                self.last_contour_last_point = a.pos;
                 // FIXME last point is not hit
-                defer self.first_contour_point = self.getPoint(self.idx + 1).pos;
 
                 // FIXME: Factor out 3 point -> resolved point logic
                 return .{
                     .line = .{
                         .a = a.pos,
-                        .b = self.first_contour_point,
+                        .b = b.pos,
                     },
                 };
             }
@@ -495,9 +495,6 @@ pub const GlyphSegmentIter = struct {
             }
 
             std.debug.assert(!b.on_curve);
-            if (self.idx + 2 >= self.glyph.x_coordinates.len) {
-                continue;
-            }
             const c = self.getPoint(self.idx + 2);
 
             const a_on = resolvePoint(a, b);
@@ -516,13 +513,38 @@ pub const GlyphSegmentIter = struct {
         pos: IVec2,
     };
 
+    // FIXME: Stateful APIs using contour idx are gross
+    fn contourStart(self: GlyphSegmentIter) usize {
+        if (self.contour_idx == 0) {
+            return 0;
+        } else {
+            return self.glyph.end_pts_of_contours[self.contour_idx - 1] + 1;
+        }
+    }
+
+    fn wrappedContourIdx(self: GlyphSegmentIter, idx: usize) usize {
+        const contour_start = self.contourStart();
+        const contour_len = self.glyph.end_pts_of_contours[self.contour_idx] + 1 - contour_start;
+
+        std.debug.print("idx: {d}, contour_start: {d}, contour_len: {d}\n", .{idx, contour_start, contour_len});
+
+        return (idx - contour_start) % contour_len + contour_start;
+    }
+
     fn getPoint(self: *GlyphSegmentIter, idx: usize) Point {
         var x_acc = self.x_acc;
         var y_acc = self.y_acc;
 
         for (self.idx..idx + 1) |i| {
-            x_acc += self.glyph.x_coordinates[i];
-            y_acc += self.glyph.y_coordinates[i];
+            const wrapped_i = self.wrappedContourIdx(i);
+            std.debug.print("wrapped i: {d}\n" ,.{wrapped_i});
+            if (wrapped_i == self.contourStart()) {
+                std.debug.print("idx is 0, last point {any}\n" ,.{self.last_contour_last_point});
+                x_acc = self.last_contour_last_point[0];
+                y_acc = self.last_contour_last_point[1];
+            }
+            x_acc += self.glyph.x_coordinates[wrapped_i];
+            y_acc += self.glyph.y_coordinates[wrapped_i];
         }
 
         const pos = IVec2{
@@ -530,7 +552,7 @@ pub const GlyphSegmentIter = struct {
             y_acc,
         };
 
-        const on_curve = self.glyph.flags[idx].on_curve_point;
+        const on_curve = self.glyph.flags[self.wrappedContourIdx(idx)].on_curve_point;
         return .{
             .on_curve = on_curve,
             .pos = pos,
@@ -542,6 +564,43 @@ pub const GlyphSegmentIter = struct {
         std.debug.assert(off.on_curve == false);
 
         return (maybe_off.pos + off.pos) / IVec2{ 2, 2 };
+    }
+};
+pub const GlyphPointIter = struct {
+    glyph: GlyphTable.SimpleGlyph,
+    x_acc: i16 = 0,
+    y_acc: i16 = 0,
+    idx: usize = 0,
+
+    pub const Output = struct {
+        point: IVec2,
+        on_curve: bool,
+    };
+
+    pub fn init(glyph: GlyphTable.SimpleGlyph) GlyphPointIter {
+        return .{
+            .glyph = glyph,
+        };
+    }
+
+    pub fn next(self: *GlyphPointIter) ?Output {
+        if (self.idx >= self.glyph.x_coordinates.len) return null;
+        defer self.idx += 1;
+
+        self.x_acc += self.glyph.x_coordinates[self.idx];
+        self.y_acc += self.glyph.y_coordinates[self.idx];
+
+        const pos = IVec2{
+            self.x_acc,
+            self.y_acc,
+        };
+
+        const on_curve = self.glyph.flags[self.idx].on_curve_point;
+        return .{
+            .on_curve = on_curve,
+            .point = pos,
+        };
+
     }
 };
 
@@ -593,6 +652,63 @@ pub fn sampleQuadBezierCurve(a: Vec2, b: Vec2, c: Vec2, t: f32) Vec2 {
     return std.math.lerp(ab, bc, t_splat);
 }
 
+pub fn flipY(in: IVec2, height: i16) IVec2 {
+    return .{ in[0], height - in[1] };
+}
+
+fn renderChar(alloc: Allocator, c: u8, ttf_parser: Ttf, subtable: CmapTable.SubtableFormat4, renderer: *Renderer, out_dir: std.fs.Dir) !void {
+    const out_w = renderer.iWidth();
+    const out_h = renderer.calcHeight();
+    renderer.drawRect(0, out_w, 0, out_h, .{ .r = 50, .g = 50, .b = 50, .a = 255 });
+    const simple_glyph = try glyphForChar(alloc, ttf_parser, subtable, c);
+    const offs = IVec2{ 200, 200 };
+    var iter = GlyphSegmentIter.init(simple_glyph);
+    while (iter.next()) |item| {
+        std.log.debug("{any}", .{item});
+        const color = Renderer.Color{ .r = 0, .g = 0, .b = 0, .a = 255 };
+        const green = Renderer.Color{ .r = 0, .g = 255, .b = 0, .a = 255 };
+        const width = 5;
+        //const radius = 25;
+        switch (item) {
+            .line => |l| {
+                const a = flipY(l.a + offs, @intCast(out_h));
+                const b = flipY(l.b + offs, @intCast(out_h));
+                //renderer.drawCircle(a[0], a[1], radius, color);
+                renderer.drawLine(a[0], a[1], b[0], b[1], width, color);
+            },
+            .bezier => |curve| {
+                const a = flipY(curve.a + offs, @intCast(out_h));
+                const b = flipY(curve.b + offs, @intCast(out_h));
+                const point_c = flipY(curve.c + offs, @intCast(out_h));
+                renderer.drawBezier(a, b, point_c, green);
+                //renderer.drawCircle(a[0], a[1], radius, color);
+                //renderer.drawLine(a[0], a[1], b[0], b[1], width, green);
+                //renderer.drawLine(b[0], b[1], point_c[0], point_c[1], width, green);
+                //renderer.drawLine(a[0], a[1], point_c[0], point_c[1], width, color);
+            },
+        }
+    }
+    //var point_iter = GlyphPointIter.init(simple_glyph);
+    //const on_color = Renderer.Color{.r = 255, .g = 0, .b = 0, .a = 255};
+    //const off_color = Renderer.Color{.r = 0, .g = 0, .b = 255, .a = 255};
+    //while (point_iter.next()) |point| {
+    //    const color = if (point.on_curve) on_color else off_color;
+    //    const point_offs = flipY(point.point + offs, @intCast(out_h));
+    //    renderer.drawCircle(point_offs[0], point_offs[1], 25.0, color);
+    //}
+
+    const fname = try std.fmt.allocPrint(alloc, "{c}.ppm", .{c});
+    defer alloc.free(fname);
+    const output = try out_dir.createFile(fname, .{});
+    defer output.close();
+    var output_buffered = std.io.bufferedWriter(output.writer());
+
+    try renderer.writePpm(output_buffered.writer());
+    try output_buffered.flush();
+
+}
+
+
 pub fn main() !void {
     const x: GlyphTable.SimpleGlyphFlag = @bitCast(@as(u8, 0x1));
     std.debug.print("{any}\n", .{x});
@@ -616,40 +732,9 @@ pub fn main() !void {
     var out_dir = try std.fs.cwd().openDir("out", .{});
     defer out_dir.close();
 
+    //try renderChar(alloc, 'B', ttf_parser,subtable, &renderer, out_dir);
     while (chars.next()) |c| {
-        renderer.drawRect(0, out_w, 0, out_h, .{ .r = 50, .g = 50, .b = 50, .a = 255 });
-        const simple_glyph = try glyphForChar(alloc, ttf_parser, subtable, c);
-        var iter = GlyphSegmentIter.init(simple_glyph);
-        while (iter.next()) |item| {
-            std.log.debug("{any}", .{item});
-            const offs = IVec2{ 200, 200 };
-            const color = Renderer.Color{ .r = 0, .g = 0, .b = 0, .a = 255 };
-            const width = 5;
-            const radius = 25;
-            switch (item) {
-                .line => |l| {
-                    const a = l.a + offs;
-                    const b = l.b + offs;
-                    renderer.drawCircle(a[0], a[1], radius, color);
-                    renderer.drawLine(a[0], a[1], b[0], b[1], width, color);
-                },
-                .bezier => |curve| {
-                    const a = curve.a + offs;
-                    const b = curve.c + offs;
-                    renderer.drawCircle(a[0], a[1], radius, color);
-                    renderer.drawLine(a[0], a[1], b[0], b[1], width, color);
-                },
-            }
-        }
-
-        const fname = try std.fmt.allocPrint(alloc, "{c}.ppm", .{c});
-        defer alloc.free(fname);
-        const output = try out_dir.createFile(fname, .{});
-        defer output.close();
-        var output_buffered = std.io.bufferedWriter(output.writer());
-
-        try renderer.writePpm(output_buffered.writer());
-        try output_buffered.flush();
+        try renderChar(alloc, c, ttf_parser,subtable, &renderer, out_dir);
     }
 
     //const num_countours = std.mem.bigToNative(i16, std.mem.bytesToValue(i16, ttf_parser.glyf.data[glyf_start..glyf_start + 2]));
