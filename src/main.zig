@@ -468,43 +468,17 @@ pub const GlyphSegmentIter = struct {
             defer self.x_acc = a.pos[0];
             defer self.y_acc = a.pos[1];
 
-            if (self.glyph.end_pts_of_contours[self.contour_idx] == self.idx) {
-                // FIXME: Stateful APIs using contour idx are gross
-                const b = self.getPoint(self.idx + 1);
-                self.contour_idx += 1;
-                self.last_contour_last_point = a.pos;
-                // FIXME last point is not hit
-
-                // FIXME: Factor out 3 point -> resolved point logic
-                return .{
-                    .line = .{
-                        .a = a.pos,
-                        .b = b.pos,
-                    },
-                };
-            }
-
             const b = self.getPoint(self.idx + 1);
-            if (a.on_curve and b.on_curve) {
-                return .{ .line = .{
-                    .a = a.pos,
-                    .b = b.pos,
-                } };
-            } else if (b.on_curve) {
-                continue;
-            }
-
-            std.debug.assert(!b.on_curve);
             const c = self.getPoint(self.idx + 2);
 
-            const a_on = resolvePoint(a, b);
-            const c_on = resolvePoint(c, b);
+            if (self.glyph.end_pts_of_contours[self.contour_idx] == self.idx) {
+                self.contour_idx += 1;
+                self.last_contour_last_point = a.pos;
+            }
 
-            return .{ .bezier = .{
-                .a = a_on,
-                .b = b.pos,
-                .c = c_on,
-            } };
+            if (abcToCurve(a, b, c)) |val| {
+                return val;
+            }
         }
     }
 
@@ -512,6 +486,29 @@ pub const GlyphSegmentIter = struct {
         on_curve: bool,
         pos: IVec2,
     };
+
+    fn abcToCurve(a: Point, b: Point, c: Point) ?Output {
+        if (a.on_curve and b.on_curve) {
+            return .{ .line = .{
+                .a = a.pos,
+                .b = b.pos,
+            } };
+        } else if (b.on_curve) {
+            return null;
+        }
+
+        std.debug.assert(!b.on_curve);
+
+        const a_on = resolvePoint(a, b);
+        const c_on = resolvePoint(c, b);
+
+        return .{ .bezier = .{
+            .a = a_on,
+            .b = b.pos,
+            .c = c_on,
+        } };
+
+    }
 
     // FIXME: Stateful APIs using contour idx are gross
     fn contourStart(self: GlyphSegmentIter) usize {
