@@ -653,38 +653,242 @@ pub fn flipY(in: IVec2, height: i16) IVec2 {
     return .{ in[0], height - in[1] };
 }
 
+const BBox = struct {
+    const invalid = BBox{
+        .min_x = std.math.maxInt(i64),
+        .max_x = std.math.minInt(i64),
+        .min_y = std.math.maxInt(i64),
+        .max_y = std.math.minInt(i64),
+    };
+
+    min_x: i64,
+    max_x: i64,
+    min_y: i64,
+    max_y: i64,
+};
+
+fn pointsBounds(points: []const IVec2) BBox {
+    var ret = BBox.invalid;
+
+    for (points) |point| {
+        ret.min_x = @min(point[0], ret.min_x);
+        ret.min_y = @min(point[1], ret.min_x);
+        ret.max_x = @max(point[0], ret.max_x);
+        ret.max_y = @max(point[1], ret.max_x);
+    }
+
+    return ret;
+}
+
+fn curveBounds(curve: GlyphSegmentIter.Output) BBox {
+    switch (curve) {
+        .line => |l| {
+            return pointsBounds(&.{l.a, l.b});
+        },
+        .bezier => |b| {
+            return pointsBounds(&.{b.a, b.b, b.c});
+        },
+    }
+}
+
+fn mergeBboxes(a: BBox, b: BBox) BBox {
+    return .{
+        .min_x = @min(a.min_x, b.min_x),
+        .max_x = @max(a.max_x, b.max_x),
+        .min_y = @min(a.min_y, b.min_y),
+        .max_y = @max(a.max_y, b.max_y),
+    };
+
+}
+
+const RowCurvePoint = struct {
+    x_pos: i64,
+    entering: bool,
+
+    pub fn format(value: RowCurvePoint, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+
+        try writer.print("{d} ({})", .{value.x_pos, value.entering});
+
+    }
+};
+
+fn findRowCurvePoints(alloc: Allocator, curves: []GlyphSegmentIter.Output, y: i64) ![]RowCurvePoint {
+    var ret = std.ArrayList(RowCurvePoint).init(alloc);
+    defer ret.deinit();
+
+    const eps = 1e-7;
+    for (curves) |curve| {
+        switch (curve) {
+            .line => |l| {
+                const a_f: @Vector(2, f32) = @floatFromInt(l.a);
+                const b_f: @Vector(2, f32) = @floatFromInt(l.b);
+                const y_f: f32 = @floatFromInt(y);
+                const t = if (l.b[1] == l.a[1] and y == l.b[1])
+                    1.0
+                else
+                     (y_f - a_f[1]) / (b_f[1] - a_f[1]);
+
+                const x = std.math.lerp(a_f[0], b_f[0], t);
+                if (!(t >= 0.0 and t <= 1.0)) {
+                    std.debug.print("Discarding point on line {any} -> {any}, t: {d}\n", .{l.a, l.b, t});
+                    continue;
+                }
+
+                if (t < eps) {
+                    std.debug.print("Discarding point on line {any} -> {any}, t close to 0\n", .{l.a, l.b});
+                    continue;
+                }
+
+                const entering = l.a[1] < l.b[1] or (l.a[1] == l.b[1] and l.a[0] < l.b[0]);
+                try ret.append(.{
+                    .entering = entering,
+                    .x_pos = @intFromFloat(@round(x))
+                });
+
+            },
+            .bezier => |b| {
+                const a_f: @Vector(2, f32) = @floatFromInt(b.a);
+                const b_f: @Vector(2, f32) = @floatFromInt(b.b);
+                const c_f: @Vector(2, f32) = @floatFromInt(b.c);
+
+                const ts = Renderer.findBezierTForY(a_f[1], b_f[1], c_f[1], @floatFromInt(y));
+                //if (@abs(ts[0] - ts[1]) < eps and @abs(ts[1]) < eps or @abs(ts[1] - 1.0) < eps) {
+                //    // Handle the case where we have a line segment followed by a
+                //    // bezier curve, where the apex of the bezier curve lines
+                //    // up perfectly with the end of the line segment
+                //    //
+                //    // In this case, I would think that the bezier curve should
+                //    // _not_ be included, as the apex of the quad essentially
+                //    // becomes a "go in then immediately go out"
+                //    //
+                //    // HOWEVER, in this case we only have half the curve, which
+                //    // means that the enter or exit is discarded, even though
+                //    // it is exactly the same point
+                //    // Set one of the ts out of bounds intentionally
+                //    ts[1] = 100.0;
+                //}
+
+                for (ts) |t| {
+                    if (!(t >= 0.0 and t <= 1.0)) {
+                        continue;
+                    }
+                    if (t < eps) {
+                        continue;
+                    }
+                    const tangent_line = Renderer.quadBezierTangentLine(a_f, b_f, c_f, t);
+                    const entering = tangent_line.a[1] <= tangent_line.b[1];
+                    const x1_f = sampleQuadBezierCurve(a_f, b_f, c_f, t)[0];
+                    const x1_px: i64 = @intFromFloat(@round(x1_f));
+                    if (x1_px == 608) {
+                        std.debug.print("608 t: {d}\n" ,.{t});
+                    }
+                    try ret.append(.{
+                        .entering = entering,
+                        .x_pos = x1_px,
+                    });
+                }
+            },
+        }
+    }
+
+    const lessThan = struct {
+        fn f(_: void, lhs: RowCurvePoint, rhs: RowCurvePoint) bool {
+            if (lhs.x_pos == rhs.x_pos) {
+                return lhs.entering and !rhs.entering;
+            }
+            return lhs.x_pos < rhs.x_pos;
+        }
+    }.f;
+    std.mem.sort(RowCurvePoint, ret.items, {}, lessThan);
+
+    return try ret.toOwnedSlice();
+}
+
 fn renderChar(alloc: Allocator, c: u8, ttf_parser: Ttf, subtable: CmapTable.SubtableFormat4, renderer: *Renderer, out_dir: std.fs.Dir) !void {
     const out_w = renderer.iWidth();
     const out_h = renderer.calcHeight();
     renderer.drawRect(0, out_w, 0, out_h, .{ .r = 50, .g = 50, .b = 50, .a = 255 });
     const simple_glyph = try glyphForChar(alloc, ttf_parser, subtable, c);
-    const offs = IVec2{ 200, 200 };
+    //const offs = IVec2{ 200, 200 };
     var iter = GlyphSegmentIter.init(simple_glyph);
+
+    var curves = std.ArrayList(GlyphSegmentIter.Output).init(alloc);
+    defer curves.deinit();
+
+    var total_bbox = BBox.invalid;
     while (iter.next()) |item| {
-        std.log.debug("{any}", .{item});
-        const color = Renderer.Color{ .r = 0, .g = 0, .b = 0, .a = 255 };
-        const green = Renderer.Color{ .r = 0, .g = 255, .b = 0, .a = 255 };
-        const width = 5;
-        //const radius = 25;
-        switch (item) {
+        try curves.append(item);
+        const item_bbox = curveBounds(item);
+        total_bbox = mergeBboxes(total_bbox, item_bbox);
+    }
+    std.debug.print("object bbox: {any}\n", .{total_bbox});
+
+    for (curves.items) |curve| {
+        switch(curve) {
             .line => |l| {
-                const a = flipY(l.a + offs, @intCast(out_h));
-                const b = flipY(l.b + offs, @intCast(out_h));
-                //renderer.drawCircle(a[0], a[1], radius, color);
-                renderer.drawLine(a[0], a[1], b[0], b[1], width, color);
+                std.debug.print("line: {any} {any}\n", .{l.a, l.b});
             },
-            .bezier => |curve| {
-                const a = flipY(curve.a + offs, @intCast(out_h));
-                const b = flipY(curve.b + offs, @intCast(out_h));
-                const point_c = flipY(curve.c + offs, @intCast(out_h));
-                renderer.drawBezier(a, b, point_c, green);
-                //renderer.drawCircle(a[0], a[1], radius, color);
-                //renderer.drawLine(a[0], a[1], b[0], b[1], width, green);
-                //renderer.drawLine(b[0], b[1], point_c[0], point_c[1], width, green);
-                //renderer.drawLine(a[0], a[1], point_c[0], point_c[1], width, color);
+            .bezier => |b| {
+                std.debug.print("bezier: {any} {any} {any}\n", .{b.a, b.b, b.c});
             },
         }
+
     }
+
+    var y = total_bbox.min_y;
+    while (y < total_bbox.max_y) {
+        defer y += 1;
+        //const flipped_y = renderer.calcHeight() - y - 50;
+        //if (flipped_y >= renderer.calcHeight() or flipped_y < 0) continue;
+        const row = renderer.getRow(y);
+
+        const row_curve_points = try findRowCurvePoints(alloc, curves.items, y);
+        defer alloc.free(row_curve_points);
+
+        std.debug.print("y: {d}, points: {any}\n" ,.{y, row_curve_points});
+
+        var winding_count: i64 = 0;
+        var start: i64 = 0;
+        for (row_curve_points) |point| {
+            if (point.entering == false) {
+                winding_count -= 1;
+            } else {
+                winding_count += 1;
+                if (winding_count == 1) {
+                    start = point.x_pos;
+                }
+            }
+            // NOTE: Always see true first due to sorting
+            if (winding_count == 0) {
+                @memset(row[@intCast(renderer.clampedX(start))..@intCast(renderer.clampedX(point.x_pos))], .{.r = 255, .g = 0, .b = 255, .a = 255});
+            }
+        }
+
+    }
+        //std.log.debug("{any}", .{item});
+        //const color = Renderer.Color{ .r = 0, .g = 0, .b = 0, .a = 255 };
+        //const green = Renderer.Color{ .r = 0, .g = 255, .b = 0, .a = 255 };
+        //const width = 5;
+        ////const radius = 25;
+        //switch (item) {
+        //    .line => |l| {
+        //        const a = flipY(l.a + offs, @intCast(out_h));
+        //        const b = flipY(l.b + offs, @intCast(out_h));
+        //        //renderer.drawCircle(a[0], a[1], radius, color);
+        //        renderer.drawLine(a[0], a[1], b[0], b[1], width, color);
+        //    },
+        //    .bezier => |curve| {
+        //        const a = flipY(curve.a + offs, @intCast(out_h));
+        //        const b = flipY(curve.b + offs, @intCast(out_h));
+        //        const point_c = flipY(curve.c + offs, @intCast(out_h));
+        //        renderer.drawBezier(a, b, point_c, green);
+        //        //renderer.drawCircle(a[0], a[1], radius, color);
+        //        //renderer.drawLine(a[0], a[1], b[0], b[1], width, green);
+        //        //renderer.drawLine(b[0], b[1], point_c[0], point_c[1], width, green);
+        //        //renderer.drawLine(a[0], a[1], point_c[0], point_c[1], width, color);
+        //    },
+        //}
+    //}
     //var point_iter = GlyphPointIter.init(simple_glyph);
     //const on_color = Renderer.Color{.r = 255, .g = 0, .b = 0, .a = 255};
     //const off_color = Renderer.Color{.r = 0, .g = 0, .b = 255, .a = 255};
@@ -719,7 +923,7 @@ pub fn main() !void {
     const ttf_parser = try Ttf.init(alloc, font_data);
     const subtable = try readSubtable(alloc, ttf_parser);
 
-    var chars = CharGenerator{};
+    //var chars = CharGenerator{};
     const out_w = 2048;
     const out_h = 2048;
     var renderer = try Renderer.init(alloc, out_w, out_h);
@@ -729,10 +933,10 @@ pub fn main() !void {
     var out_dir = try std.fs.cwd().openDir("out", .{});
     defer out_dir.close();
 
-    //try renderChar(alloc, 'B', ttf_parser,subtable, &renderer, out_dir);
-    while (chars.next()) |c| {
-        try renderChar(alloc, c, ttf_parser,subtable, &renderer, out_dir);
-    }
+    try renderChar(alloc, 'B', ttf_parser,subtable, &renderer, out_dir);
+    //while (chars.next()) |c| {
+    //    try renderChar(alloc, c, ttf_parser,subtable, &renderer, out_dir);
+    //}
 
     //const num_countours = std.mem.bigToNative(i16, std.mem.bytesToValue(i16, ttf_parser.glyf.data[glyf_start..glyf_start + 2]));
     //std.log.debug("glyph index for {c} is {d} ({d}..{d}), {d} contours\n", .{char, glyph_index, ttf_parser.loca[glyph_index], ttf_parser.loca[glyph_index + 1], num_countours});

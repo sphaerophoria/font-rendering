@@ -96,7 +96,7 @@ pub fn drawLine(self: *Renderer, ax: i64, ay: i64, bx: i64, by: i64, width: i64,
 
 const CanvasPoint = @Vector(2, i64);
 
-fn findBezierTForY(ay: f32, by: f32, cy: f32, y: f32) [2]f32 {
+pub fn findBezierTForY(ay: f32, by: f32, cy: f32, y: f32) [2]f32 {
     const denominator_i = ay - 2 * by + cy;
 
     if (denominator_i == 0) {
@@ -116,12 +116,24 @@ fn findBezierTForY(ay: f32, by: f32, cy: f32, y: f32) [2]f32 {
     return .{ out_1, out_2 };
 }
 
-pub fn sampleQuadBezierCurve(a: @Vector(2, f32), b: @Vector(2, f32), c: @Vector(2, f32), t: f32) @Vector(2, f32) {
+const TangentLine = struct {
+    a: @Vector(2, f32),
+    b: @Vector(2, f32),
+};
+
+pub fn quadBezierTangentLine(a: @Vector(2, f32), b: @Vector(2, f32), c: @Vector(2, f32), t: f32) TangentLine {
     const t_splat: @Vector(2, f32) = @splat(t);
     const ab = std.math.lerp(a, b, t_splat);
     const bc = std.math.lerp(b, c, t_splat);
+    return .{
+        .a = ab,
+        .b = bc,
+    };
+}
 
-    return std.math.lerp(ab, bc, t_splat);
+pub fn sampleQuadBezierCurve(a: @Vector(2, f32), b: @Vector(2, f32), c: @Vector(2, f32), t: f32) @Vector(2, f32) {
+    const tangent_line = quadBezierTangentLine(a, b, c, t);
+    return std.math.lerp(tangent_line.a, tangent_line.b, @splat(t));
 }
 
 
@@ -233,15 +245,15 @@ const Range = struct {
     end: i64,
 };
 
-fn clampedY(self: Renderer, val: i64) i64 {
+pub fn clampedY(self: Renderer, val: i64) i64 {
     return @intCast(std.math.clamp(val, 0, self.calcHeight()));
 }
 
-fn clampedX(self: Renderer, val: i64) i64 {
+pub fn clampedX(self: Renderer, val: i64) i64 {
     return @intCast(std.math.clamp(val, 0, self.iWidth()));
 }
 
-fn getRow(self: Renderer, y: i64) []Color {
+pub fn getRow(self: Renderer, y: i64) []Color {
     const row_start: usize = @intCast(y * self.iWidth());
     const row_end: usize = row_start + self.width;
     return self.canvas[row_start..row_end];
