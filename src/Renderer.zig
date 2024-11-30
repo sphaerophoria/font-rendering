@@ -96,23 +96,45 @@ pub fn drawLine(self: *Renderer, ax: i64, ay: i64, bx: i64, by: i64, width: i64,
 
 const CanvasPoint = @Vector(2, i64);
 
-pub fn findBezierTForY(ay: f32, by: f32, cy: f32, y: f32) [2]f32 {
-    const denominator_i = ay - 2 * by + cy;
+pub fn findBezierTForY(p1: f32, p2: f32, p3: f32, y: f32) [2]f32 {
+    // Bezier curve formula comes from lerping p1->p2 by t, p2->p3 by t, and
+    // then lerping the line from those two points by t as well
+    //
+    // p12 = (t * (p2 - p1)) + p1
+    // p23 = (t * (p3 - p2)) + p2
+    // out = (t * (p23 - p12)) + p12
+    //
+    // expanding and simplifying...
+    // p12 = t*p2 - t*p1 + p1
+    // p23 = t*p3 - t*p2 + p2
+    // out = t(t*p3 - t*p2 + p2) - t(t*p2 - t*p1 + p1) + t*p2 - t*p1 + p1
+    // out = t^2*p3 - t^2*p2 + t*p2 - t^2*p2 + t^2*p1 - t*p1 + t*p2 - t*p1 + p1
+    // out = t^2(p3 - 2*p2 + p1) + t(p2 - p1 + p2 - p1) + p1
+    // out = t^2(p3 - 2*p2 + p1) + 2*t(p2 - p1) + p1
+    //
+    // Which now looks like a quadratic formula that we can solve for.
+    // Calling t^2 coefficient a, t coefficient b, and the remainder c...
+    const a = p3 - 2 * p2 + p1;
+    const b = 2 * (p2 - p1);
+    // Note that we are solving for out == y, so we need to adjust the c term
+    // to p1 - y
+    const c = p1 - y;
 
-    if (denominator_i == 0) {
-        // Linear function
-        var ret = -1 * (-2 * by + cy + y);
-        // FIXME: What if denom is 0
-        ret /= 2 * (by - cy);
+    const eps = 1e-7;
+    const not_quadratic = @abs(a) < eps;
+    const not_linear = not_quadratic and @abs(b) < eps;
+    if (not_linear) {
+        // I guess in this case we can return any t, as all t values will
+        // result in the same y value.
+        return .{ 0.5, 0.5 };
+    } else if (not_quadratic) {
+        // bt + c = 0 (c accounts for y)
+        const ret = -c / b;
         return .{ ret, ret };
     }
 
-    var numerator: f32 = -ay * cy + ay * y + by * by - 2 * by * y + cy * y;
-    numerator = @sqrt(numerator);
-    const offs_term: f32 = ay - by;
-    const denominator: f32 = denominator_i;
-    const out_1  = (numerator + offs_term) / denominator;
-    const out_2  = -(numerator - offs_term) / denominator;
+    const out_1 = (-b + @sqrt(b * b - 4 * a * c)) / (2 * a);
+    const out_2 = (-b - @sqrt(b * b - 4 * a * c)) / (2 * a);
     return .{ out_1, out_2 };
 }
 
@@ -133,32 +155,29 @@ pub fn quadBezierTangentLine(a: @Vector(2, f32), b: @Vector(2, f32), c: @Vector(
 
 pub fn sampleQuadBezierCurve(a: @Vector(2, f32), b: @Vector(2, f32), c: @Vector(2, f32), t: f32) @Vector(2, f32) {
     const tangent_line = quadBezierTangentLine(a, b, c, t);
-    return std.math.lerp(tangent_line.a, tangent_line.b, @splat(t));
+    return std.math.lerp(tangent_line.a, tangent_line.b, @as(@Vector(2, f32), @splat(t)));
 }
 
-
 test "bezier solving" {
-    const curves = [_][3]@Vector(2, f32) {
+    const curves = [_][3]@Vector(2, f32){
         .{
-            .{-20, 20},
-            .{0, 0},
-            .{20, 20},
+            .{ -20, 20 },
+            .{ 0, 0 },
+            .{ 20, 20 },
         },
         .{
-            .{-15, -30},
-            .{5, 15},
-            .{10, 20},
+            .{ -15, -30 },
+            .{ 5, 15 },
+            .{ 10, 20 },
         },
         .{
-            .{40, -30},
-            .{80, -10},
-            .{20, 10},
+            .{ 40, -30 },
+            .{ 80, -10 },
+            .{ 20, 10 },
         },
     };
 
-    const ts = [_]f32{
-        0.0, 0.1, 0.4, 0.5, 0.8, 1.0
-    };
+    const ts = [_]f32{ 0.0, 0.1, 0.4, 0.5, 0.8, 1.0 };
 
     for (curves) |curve| {
         for (ts) |in_t| {
@@ -173,10 +192,9 @@ test "bezier solving" {
             if (@abs(t1 - in_t) > @abs(t2 - in_t)) {
                 std.mem.swap(f32, &t1, &t2);
             }
-            try std.testing.expectApproxEqAbs(t1, in_t, 0.001);
+            try std.testing.expectApproxEqAbs(in_t, t1, 0.001);
 
             if (t2 <= 1.0 and t2 >= 0.0) {
-
                 const point2 = sampleQuadBezierCurve(
                     curve[0],
                     curve[1],
@@ -195,31 +213,35 @@ pub fn drawBezier(self: *Renderer, a: CanvasPoint, b: CanvasPoint, c: CanvasPoin
     const b_f: @Vector(2, f32) = @floatFromInt(b);
     const c_f: @Vector(2, f32) = @floatFromInt(c);
 
-    const min_y = self.clampedY(std.mem.min(i64, &.{a[1], b[1], c[1]}));
-    const max_y = self.clampedY(std.mem.max(i64, &.{a[1], b[1], c[1]}));
+    const min_y = self.clampedY(std.mem.min(i64, &.{ a[1], b[1], c[1] }));
+    const max_y = self.clampedY(std.mem.max(i64, &.{ a[1], b[1], c[1] }));
 
     var y = min_y;
     while (y < max_y) {
         defer y += 1;
 
+        // If our curve is relatively flat, we will have many xs for the same
+        // y. Act as if we want to sample all x values for all y values within
+        // our pixel. This means we sample from y -> y + 1 and color in the
+        // whole range
+        //
+        // There may be multiple points for both values.
+        //
+        // We can assume that the first/second T values should be paired with
+        // eachother. These should be on consistent sides of the quadratic curve
         const t1s = findBezierTForY(a_f[1], b_f[1], c_f[1], @floatFromInt(y));
         const t2s = findBezierTForY(a_f[1], b_f[1], c_f[1], @floatFromInt(y + 1));
         for (t1s, t2s) |t1, t2| {
             if (!(t1 >= 0.0 and t1 <= 1.0 and t2 >= 0.0 and t2 <= 1.0)) {
-                std.debug.print("Skipping due to T {d} {d}\n", .{t1, t2});
                 continue;
             }
-            const x1_f = sampleQuadBezierCurve(a_f, b_f, c_f, t1)[0];
-            const x2_f = sampleQuadBezierCurve(a_f, b_f, c_f, t2)[0];
+            const x1_f = sampleQuadBezierCurve(a_f[0], b_f[0], c_f[0], t1);
+            const x2_f = sampleQuadBezierCurve(a_f[0], b_f[0], c_f[0], t2);
             const x1_px: i64 = @intFromFloat(@round(x1_f));
             const x2_px: i64 = @intFromFloat(@round(x2_f + 1));
 
             const x1_clamped: usize = @intCast(self.clampedX(@min(x1_px, x2_px)));
             const x2_clamped: usize = @intCast(self.clampedX(@max(x1_px, x2_px) + 1));
-
-            if (x2_clamped - x1_clamped == 0) {
-                std.debug.print("Nothing rendering sadge :(\n", .{});
-            }
 
             const row = self.getRow(y);
             @memset(row[x1_clamped..x2_clamped], color);
